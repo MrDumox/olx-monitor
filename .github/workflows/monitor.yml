@@ -2,9 +2,8 @@ name: OLX monitor
 
 on:
   schedule:
-    # Repo publiczne: co 10 min. Repo prywatne: ustaw "*/30 * * * *",
-    # żeby zmieścić się w darmowych 2000 minutach/miesiąc.
-    - cron: "*/10 * * * *"
+    # Co 10 min, przesunięte o 3 min od pełnych minut, bo o :00 GitHub najbardziej się spóźnia.
+    - cron: "3-59/10 * * * *"
   workflow_dispatch:
 
 permissions:
