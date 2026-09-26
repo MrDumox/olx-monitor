@@ -1,0 +1,4 @@
+requests>=2.31.0
+# Podszywa się pod odcisk TLS przeglądarki — bez tego OLX (CloudFront/WAF) zwraca 403.
+curl_cffi>=0.7.0
+beautifulsoup4>=4.12.0
