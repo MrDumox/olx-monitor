@@ -15,6 +15,7 @@ import logging
 import re
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
@@ -48,6 +49,9 @@ EXTENDED_RESULTS_MARKER = re.compile(r"większej odległości", re.I)
 IGNORED_PARAMS = {"min_id", "reason", "page", "search[order]"}
 PHOTO_SIZE = "640x480"
 EMBED_COLOR = 0x23E5DB
+REFRESHED_COLOR = 0xF5A623
+MONTHS = ["stycznia", "lutego", "marca", "kwietnia", "maja", "czerwca", "lipca",
+          "sierpnia", "września", "października", "listopada", "grudnia"]
 
 
 def normalize_search_url(url: str) -> str:
@@ -101,9 +105,9 @@ def _extended_results_divider(soup: BeautifulSoup):
     return soup.find("p", string=EXTENDED_RESULTS_MARKER)
 
 
-def _photos_by_id(soup: BeautifulSoup) -> dict[str, str]:
-    # Przeglądarka doładowuje zdjęcia dalszych kart dopiero przy przewijaniu,
-    # więc bierzemy je z JSON-a osadzonego w stronie.
+def _ad_details_by_id(soup: BeautifulSoup) -> dict[str, dict]:
+    # Przeglądarka doładowuje zdjęcia dalszych kart dopiero przy przewijaniu, a dat wystawienia
+    # i odświeżenia na kartach nie ma, więc bierzemy je z JSON-a osadzonego w stronie.
     script = soup.find("script", string=re.compile(r"__PRERENDERED_STATE__"))
     m = script and re.search(r'__PRERENDERED_STATE__\s*=\s*("(?:[^"\\]|\\.)*")', script.string)
     if not m:
@@ -113,9 +117,14 @@ def _photos_by_id(soup: BeautifulSoup) -> dict[str, str]:
     except (ValueError, KeyError, TypeError):
         return {}
     return {
-        extract_id_from_url(ad["url"]): re.sub(r";s=\d+x\d+", f";s={PHOTO_SIZE}", ad["photos"][0])
+        extract_id_from_url(ad["url"]): {
+            "photo": (re.sub(r";s=\d+x\d+", f";s={PHOTO_SIZE}", ad["photos"][0])
+                      if ad.get("photos") else None),
+            "created": ad.get("createdTime"),
+            "refreshed": ad.get("lastRefreshTime"),
+        }
         for ad in ads
-        if ad.get("url") and ad.get("photos")
+        if ad.get("url")
     }
 
 
@@ -125,7 +134,7 @@ def parse_listings(soup: BeautifulSoup) -> list[dict]:
         cards = divider.find_all_previous(attrs={"data-cy": "l-card"})[::-1]
     else:
         cards = soup.find_all(attrs={"data-cy": "l-card"})
-    photos = _photos_by_id(soup)
+    details = _ad_details_by_id(soup)
 
     listings = []
     for card in cards:
@@ -170,6 +179,7 @@ def parse_listings(soup: BeautifulSoup) -> list[dict]:
 
             img = card.find("img")
             card_photo = img.get("src", "") if img else ""
+            info = details.get(ad_id, {})
 
             listings.append({
                 "id": ad_id,
@@ -180,7 +190,9 @@ def parse_listings(soup: BeautifulSoup) -> list[dict]:
                 "lokalizacja": lokalizacja,
                 "data": data_dodania,
                 "url": url,
-                "photo": photos.get(ad_id) or (card_photo if card_photo.startswith("http") else None),
+                "photo": info.get("photo") or (card_photo if card_photo.startswith("http") else None),
+                "created": info.get("created"),
+                "refreshed": info.get("refreshed"),
             })
         except Exception as e:
             logger.debug("Pominięto kartę ogłoszenia: %s", e, exc_info=True)
@@ -196,36 +208,46 @@ def has_next_page(soup: BeautifulSoup, page: int) -> bool:
     )
 
 
-def find_new_listings(search_url: str, seen: set[str]) -> list[dict]:
-    """Zwraca ogłoszenia spoza `seen`, od najnowszego."""
-    new: dict[str, dict] = {}
+def fetch_listings(search_url: str) -> list[dict]:
+    """Zwraca ogłoszenia z pierwszych MAX_PAGES stron wyników, od najnowszego."""
+    listings: dict[str, dict] = {}
     for page in range(1, MAX_PAGES + 1):
         url = search_url if page == 1 else f"{search_url}&page={page}"
         logger.info("Strona %d: %s", page, url)
         soup = fetch_page(url)
-        listings = parse_listings(soup)
-        logger.info("Ogłoszeń na stronie: %d", len(listings))
-        if not listings:
+        page_listings = parse_listings(soup)
+        logger.info("Ogłoszeń na stronie: %d", len(page_listings))
+        if not page_listings:
             break
-        for listing in listings:
-            if listing["id"] not in seen:
-                new.setdefault(listing["id"], listing)
+        for listing in page_listings:
+            listings.setdefault(listing["id"], listing)
         if not has_next_page(soup, page) or _extended_results_divider(soup):
             break
         time.sleep(DELAY_BETWEEN_PAGES)
-    return list(new.values())
+    return list(listings.values())
 
 
-def load_state(path: Path) -> dict[str, set[str]]:
-    """{znormalizowany link wyszukiwania: zbiór widzianych ID}"""
+def change_kind(listing: dict, seen: dict[str, str]) -> str | None:
+    """'new', 'refreshed' albo None, gdy nie ma o czym powiadamiać."""
+    if listing["id"] not in seen:
+        return "new"
+    known = seen[listing["id"]]
+    if (known and listing["refreshed"]
+            and datetime.fromisoformat(listing["refreshed"]) > datetime.fromisoformat(known)):
+        return "refreshed"
+    return None
+
+
+def load_state(path: Path) -> dict[str, dict[str, str]]:
+    """{znormalizowany link wyszukiwania: {ID ogłoszenia: data ostatniego odświeżenia albo ""}}"""
     if path.exists():
-        return {url: set(ids) for url, ids in json.loads(path.read_text(encoding="utf-8")).items()}
+        return json.loads(path.read_text(encoding="utf-8"))
     return {}
 
 
-def save_state(path: Path, state: dict[str, set[str]]) -> None:
+def save_state(path: Path, state: dict[str, dict[str, str]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    data = {url: sorted(ids) for url, ids in state.items()}
+    data = {url: dict(sorted(ads.items())) for url, ads in state.items()}
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
@@ -235,7 +257,12 @@ def _format_price(listing: dict) -> str:
     return f"{listing['price']:,} zł".replace(",", " ")
 
 
-def build_embed(listing: dict) -> dict:
+def _format_date(iso: str) -> str:
+    d = datetime.fromisoformat(iso)
+    return f"{d.day} {MONTHS[d.month - 1]} {d.year}"
+
+
+def build_embed(listing: dict, refreshed: bool = False) -> dict:
     cena = _format_price(listing)
     if listing["negotiable"]:
         cena += "\ndo negocjacji"
@@ -248,9 +275,13 @@ def build_embed(listing: dict) -> dict:
     embed = {
         "title": listing["title"][:256],
         "url": listing["url"],
-        "color": EMBED_COLOR,
+        "color": REFRESHED_COLOR if refreshed else EMBED_COLOR,
         "fields": fields,
     }
+    if refreshed:
+        embed["description"] = "**Odświeżone**"
+        if listing["created"]:
+            embed["description"] += f" · wystawione {_format_date(listing['created'])}"
     if listing["data"]:
         embed["footer"] = {"text": listing["data"]}
     if listing["photo"]:
@@ -290,17 +321,17 @@ def main() -> None:
 
     state = load_state(SEEN_FILE)
     # Budujemy stan od nowa, więc linki usunięte z SEARCH_URLS znikają też z pliku.
-    new_state: dict[str, set[str]] = {}
+    new_state: dict[str, dict[str, str]] = {}
     failed = 0
 
     for search_url in map(normalize_search_url, SEARCH_URLS):
         seen = state.get(search_url)
         first_run = seen is None
-        seen = set() if first_run else seen
+        seen = {} if first_run else seen
         logger.info("Wyszukiwanie: %s (zapamiętanych: %d)", search_url, len(seen))
 
         try:
-            new = find_new_listings(search_url, seen)
+            listings = fetch_listings(search_url)
         except requests.RequestException as e:
             logger.error("Nie udało się pobrać OLX: %s", e)
             failed += 1
@@ -308,27 +339,36 @@ def main() -> None:
                 new_state[search_url] = seen
             continue
 
-        if args.dry_run:
-            for listing in new:
-                logger.info("[NOWE] %s", summary(listing))
-            logger.info("--dry-run: %d nowych ogłoszeń.", len(new))
-            continue
-
         # Nowe wyszukiwanie tylko zapamiętuje obecne ogłoszenia, żeby nie zasypać kanału
         # kilkudziesięcioma starymi ofertami; wiadomość startowa potwierdza, że webhook działa.
         if first_run:
-            msg = (f"Zaczynam obserwować wyszukiwanie – zapamiętano {len(new)} aktualnych "
-                   f"ogłoszeń, od teraz dostaniesz tylko nowe.\n{search_url}")
+            if args.dry_run:
+                logger.info("--dry-run: nowe wyszukiwanie, zapamiętałbym %d ogłoszeń.", len(listings))
+                continue
+            msg = (f"Zaczynam obserwować wyszukiwanie – zapamiętano {len(listings)} aktualnych "
+                   f"ogłoszeń, od teraz dostaniesz tylko nowe i odświeżone.\n{search_url}")
             if notify.send_discord(webhook, content=msg):
-                new_state[search_url] = {listing["id"] for listing in new}
+                new_state[search_url] = {l["id"]: l["refreshed"] or "" for l in listings}
             else:
                 failed += 1
             continue
 
-        for listing in reversed(new):
-            logger.info("[NOWE] %s", summary(listing))
-            if notify.send_discord(webhook, embed=build_embed(listing)):
-                seen.add(listing["id"])
+        changes = []
+        for listing in reversed(listings):
+            kind = change_kind(listing, seen)
+            if kind:
+                changes.append((listing, kind))
+            elif not seen[listing["id"]] and listing["refreshed"]:
+                seen[listing["id"]] = listing["refreshed"]
+        logger.info("Nowych: %d, odświeżonych: %d",
+                    sum(k == "new" for _, k in changes), sum(k == "refreshed" for _, k in changes))
+
+        for listing, kind in changes:
+            logger.info("[%s] %s", "NOWE" if kind == "new" else "ODŚWIEŻONE", summary(listing))
+            if args.dry_run:
+                continue
+            if notify.send_discord(webhook, embed=build_embed(listing, refreshed=kind == "refreshed")):
+                seen[listing["id"]] = listing["refreshed"] or ""
             else:
                 failed += 1
         new_state[search_url] = seen

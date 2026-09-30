@@ -8,6 +8,7 @@ Parsowanie OLX pochodzi z projektu [mar0ls/olx-monitor](https://github.com/mar0l
 
 - Każde uruchomienie pobiera 1–2 strony wyników (od najnowszych) dla każdego linku i porównuje je z listą już widzianych ogłoszeń w `data/seen.json`.
 - Nowe ogłoszenia idą na Discord jako karta: klikalny tytuł, cena (z dopiskiem "do negocjacji"), metraż, lokalizacja, data i miniatura zdjęcia.
+- **Odświeżone** ogłoszenia (właściciel odświeżył je na OLX) też przychodzą, jako pomarańczowa karta z datą wystawienia. Dla ofert z otodom.pl OLX nie podaje dat, więc te przychodzą tylko jako nowe.
 - **Nowy link** przy pierwszym sprawdzeniu tylko zapamiętuje obecne ogłoszenia i wysyła jedną wiadomość startową, żeby nie zasypać kanału starymi ofertami.
 - Oferty z otodom.pl, które OLX pokazuje w swoich wynikach, też są wysyłane.
 
